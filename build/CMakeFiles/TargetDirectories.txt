@@ -1,2 +1,0 @@
-/home/ubuntu/project/luckfox_pico_rtsp_opencv/build/CMakeFiles/edit_cache.dir
-/home/ubuntu/project/luckfox_pico_rtsp_opencv/build/CMakeFiles/rebuild_cache.dir
