@@ -1,0 +1,3 @@
+/home/ubuntu/project/luckfox_pico_rtsp_opencv/luckfox_rtsp_opencv_demo/luckfox_rtsp_opencv
+/home/ubuntu/project/luckfox_pico_rtsp_opencv/luckfox_rtsp_opencv_demo/lib/librknnmrt.so
+/home/ubuntu/project/luckfox_pico_rtsp_opencv/luckfox_rtsp_opencv_demo/lib/librga.so
