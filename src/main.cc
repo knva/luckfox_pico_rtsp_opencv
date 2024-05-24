@@ -134,8 +134,10 @@ int get_predicted_digit(const std::vector<int8_t *> &output_mems_nchw)
 	return predicted_digit;
 }
 
-
+// 在图像中找到数字的轮廓，同时减小找到轮廓时的抖动
 cv::Rect find_digit_contour(const cv::Mat &image) {
+	
+	// 预处理图像
     cv::Mat gray, blurred, edged;
     cv::cvtColor(image, gray, cv::COLOR_BGR2GRAY);
     cv::GaussianBlur(gray, blurred, cv::Size(5, 5), 0);
@@ -146,6 +148,7 @@ cv::Rect find_digit_contour(const cv::Mat &image) {
     cv::dilate(edged, edged, kernel);
     cv::erode(edged, edged, kernel);
 
+	// 查找轮廓，声明一个变量来存储轮廓
     std::vector<std::vector<cv::Point>> contours;
     cv::findContours(edged, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
 
@@ -158,16 +161,143 @@ cv::Rect find_digit_contour(const cv::Mat &image) {
                                             [](const std::vector<cv::Point>& a, const std::vector<cv::Point>& b) {
                                                 return cv::contourArea(a) < cv::contourArea(b);
                                             });
+	
+	//	**轮廓面积过滤**：在找到轮廓之后，可以排除那些面积过小的轮廓。这样可以减少不必要的小轮廓对整体结果的影响。
+	if (cv::contourArea(*largest_contour) < 10) {
+		return cv::Rect();
+	}
 
-    return cv::boundingRect(*largest_contour);
+	// **轮廓形状过滤**：除了面积外，还可以考虑其他形状特征，如轮廓宽高比。这样可以排除一些不规则的轮廓，从而提高准确性。
+	cv::Rect bounding_box = cv::boundingRect(*largest_contour);
+	float aspect_ratio = static_cast<float>(bounding_box.width) / bounding_box.height;
+	if (aspect_ratio < 0.2 || aspect_ratio > 3) {
+		return cv::Rect();
+	}
+
+	// **轮廓稳定性检测**：
+	// 通过比较当前帧和之前几帧的轮廓位置来判断轮廓的稳定性。
+	// 如果多帧之间的轮廓位置变化较小，则可以认为轮廓比较稳定，不需要进行过多的调整。
+	static std::vector<cv::Rect> prev_bounding_boxes;
+	if (prev_bounding_boxes.size() > 5) {
+		prev_bounding_boxes.erase(prev_bounding_boxes.begin());
+	}
+	prev_bounding_boxes.push_back(bounding_box);
+	if (prev_bounding_boxes.size() == 5) {
+		float avg_width = 0.0;
+		float avg_height = 0.0;
+		for (const auto& box : prev_bounding_boxes) {
+			avg_width += box.width;
+			avg_height += box.height;
+		}
+		avg_width /= prev_bounding_boxes.size();
+		avg_height /= prev_bounding_boxes.size();
+		float width_diff = std::abs(bounding_box.width - avg_width) / avg_width;
+		float height_diff = std::abs(bounding_box.height - avg_height) / avg_height;
+		if (width_diff > 0.1 || height_diff > 0.1) {
+			return cv::Rect();
+		}
+	}
+	// 对图像边框每个方向扩大15个像素
+	bounding_box.x = std::max(0, bounding_box.x - 15);
+	bounding_box.y = std::max(0, bounding_box.y - 15);
+	bounding_box.width = std::min(image.cols - bounding_box.x, bounding_box.width + 30);
+	bounding_box.height = std::min(image.rows - bounding_box.y, bounding_box.height + 30);
+
+	// 返回最大轮廓的边界框
+	return bounding_box;
 }
+
+// 预处理数字区域
 cv::Mat preprocess_digit_region(const cv::Mat &region)
 {
-	cv::Mat gray, resized, normalized;
+	// 将图像转换为灰度图像，然后调整大小为28x28，最后将像素值归一化为0到1之间的浮点数
+	cv::Mat gray, resized, bitwized, normalized;
 	cv::cvtColor(region, gray, cv::COLOR_BGR2GRAY);
-	cv::resize(gray, resized, cv::Size(28, 28), 0, 0, cv::INTER_LINEAR);
-	resized.convertTo(normalized, CV_32F, 1.0 / 255.0);
-	return normalized;
+	
+	// 扩大图像中的数字轮廓，使其更容易识别
+	cv::threshold(gray, gray, 0, 255, cv::THRESH_BINARY | cv::THRESH_OTSU);
+
+	// 调整图像颜色，将图像颜色中低于127的像素值设置为0，高于200的像素值设置为255
+	cv::threshold(gray, gray, 127, 255, cv::THRESH_BINARY_INV);
+
+	// 对图像黑白进行反转，黑色变成白色，白色变成黑色
+	cv::bitwise_not(gray, bitwized);
+	// 手动实现黑白反转
+	for (int i = 0; i < bitwized.rows; i++)
+	{
+		for (int j = 0; j < bitwized.cols; j++)
+		{
+			bitwized.at<uchar>(i, j) = 255 - bitwized.at<uchar>(i, j);
+		}
+	}
+
+	// 将图片大小调整为28x28，图片形状不发生畸变，过短的部分使用黑色填充
+	cv::resize(bitwized, resized, cv::Size(28, 28), 0, 0, cv::INTER_AREA);
+
+
+	return resized;
+}
+
+
+// 将量化的INT8数据转换为浮点数
+// Parameters:
+//   qnt: 量化后的整数数据
+//   zp: 零点（zero point）值，用于零点偏移（zero-point offset）
+//   scale: 缩放因子，用于缩放量化后的整数数据到浮点数范围
+// Returns:
+//   浮点数，表示经过反量化（dequantization）后的数据
+static float deqnt_affine_to_f32(int8_t qnt, int32_t zp, float scale) { return ((float)qnt - (float)zp) * scale; }
+
+// 将模型输出进行归一化，并计算输出的概率分布
+// Parameters:
+//   output_attrs: 输出张量属性，包含了零点（zero point）值和缩放因子等信息
+//   output: 模型输出的数据，以INT8格式存储
+//   out_fp32: 存储归一化后的浮点数输出数据
+int output_normalization(rknn_tensor_attr* output_attrs, uint8_t *output, float *out_fp32)
+{
+    int32_t zp =  output_attrs->zp;
+    float scale = output_attrs->scale;
+
+	// 将INT8格式的输出数据进行反量化为浮点数，并进行存储
+    for(int i = 0; i < 10; i ++)
+        out_fp32[i] = deqnt_affine_to_f32(output[i],zp,scale);
+
+	// 计算输出数据的L2范数
+    float sum = 0;
+    for(int i = 0; i < 10; i++)
+        sum += out_fp32[i] * out_fp32[i];
+    
+	// 对归一化后的浮点数输出进行归一化处理，确保输出数据的范围在[0,1]之间
+	float norm = sqrt(sum);
+    for(int i = 0; i < 10; i++)
+        out_fp32[i] /= norm; 
+	
+	// 打印输出数据的值
+	printf("\n===================Output data values:===================\n");
+	for (int i = 0; i < 10; ++i)
+	{
+		printf("%f ", out_fp32[i]);
+	}
+	printf("\n");
+
+	// 找出最大概率对应的数字，并记录最大概率及其对应的数字
+	float max_prob = -1.0;
+	int predicted_digit = -1;
+	// 计算最大值的索引
+	for (int i = 0; i < 10; ++i)
+	{
+		if (out_fp32[i] > max_prob)
+		{
+			max_prob = out_fp32[i];
+			predicted_digit = i;
+		}
+	}
+	return predicted_digit;
+	// // 将预测的数字及其对应的概率记录到队列中
+	// predictions_queue.push_back({predicted_digit, max_prob});
+
+	// // 打印预测的数字与其对应的概率
+	// printf("========Predicted digit: %d, Probability: %.2f========\n\n", predicted_digit, max_prob);
 }
 
 int run_inference(cv::Mat &frame)
@@ -291,49 +421,37 @@ int run_inference(cv::Mat &frame)
 		return -1;
 	}
 
-	printf("output origin tensors:\n");
-	rknn_tensor_attr orig_output_attrs[io_num.n_output];
-	memset(orig_output_attrs, 0, io_num.n_output * sizeof(rknn_tensor_attr));
-	for (uint32_t i = 0; i < io_num.n_output; i++)
-	{
-		orig_output_attrs[i].index = i;
-		// query info
-		ret = rknn_query(ctx, RKNN_QUERY_OUTPUT_ATTR, &(orig_output_attrs[i]), sizeof(rknn_tensor_attr));
-		if (ret != RKNN_SUCC)
-		{
-			printf("rknn_query fail! ret=%d\n", ret);
-			return -1;
-		}
-		dump_tensor_attr(&orig_output_attrs[i]);
-	}
-
-	// 创建存储模型输出的NCHW格式数据的向量
-	std::vector<int8_t *> output_mems_nchw;
-	for (uint32_t i = 0; i < io_num.n_output; ++i)
-	{
-		int size = orig_output_attrs[i].size_with_stride;
-		int8_t *output_mem = new int8_t[size];
-		output_mems_nchw.push_back(output_mem);
-	}
-
-	// 进行NC1HWC2_int8_to_NCHW_int8转换
-	// for (uint32_t i = 0; i < io_num.n_output; i++) {
-	//     int channel = orig_output_attrs[i].dims[1];
-	//     int h = orig_output_attrs[i].n_dims > 2 ? orig_output_attrs[i].dims[2] : 1;
-	//     int w = orig_output_attrs[i].n_dims > 3 ? orig_output_attrs[i].dims[3] : 1;
-	//     int hw = h * w;
-	//     NC1HWC2_int8_to_NCHW_int8((int8_t*)output_mems[i]->virt_addr, (int8_t*)output_mems_nchw[i],
-	//                               (int*)output_attrs[i].dims, channel, h, w);
+	// printf("output origin tensors:\n");
+	// rknn_tensor_attr orig_output_attrs[io_num.n_output];
+	// memset(orig_output_attrs, 0, io_num.n_output * sizeof(rknn_tensor_attr));
+	// for (uint32_t i = 0; i < io_num.n_output; i++)
+	// {
+	// 	orig_output_attrs[i].index = i;
+	// 	// query info
+	// 	ret = rknn_query(ctx, RKNN_QUERY_OUTPUT_ATTR, &(orig_output_attrs[i]), sizeof(rknn_tensor_attr));
+	// 	if (ret != RKNN_SUCC)
+	// 	{
+	// 		printf("rknn_query fail! ret=%d\n", ret);
+	// 		return -1;
+	// 	}
+	// 	dump_tensor_attr(&orig_output_attrs[i]);
 	// }
 
-	// 获取预测的数字
-	int predicted_digit = get_predicted_digit(output_mems_nchw);
+	
+	uint8_t  *output= (uint8_t*)malloc(sizeof(uint8_t) * 10); 
+	float *out_fp32 = (float*)malloc(sizeof(float) * 10); 
 
-	// 释放内存
-	for (uint32_t i = 0; i < io_num.n_output; ++i)
-	{
-		delete[] output_mems_nchw[i];
-	}
+
+	output = (uint8_t *)output_mems[0]->virt_addr;
+
+	// 获取预测的数字
+	int predicted_digit = output_normalization(&output_attrs[0], output, out_fp32);
+
+	// // 释放内存
+	// for (uint32_t i = 0; i < io_num.n_output; ++i)
+	// {
+	// 	delete[] output_mems_nchw[i];
+	// }
 	rknn_destroy_mem(ctx, input_mems[0]);
 	for (uint32_t i = 0; i < io_num.n_output; ++i)
 	{
