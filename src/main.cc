@@ -41,36 +41,16 @@ rknn_tensor_type input_type = RKNN_TENSOR_UINT8;
 rknn_tensor_format input_layout = RKNN_TENSOR_NHWC;
 
 rknn_context ctx = 0;
-
-// 量化模型的npu输出结果为int8数据类型，后处理要按照int8数据类型处理
-// 如下提供了int8排布的NC1HWC2转换成int8的nchw转换代码
-int NC1HWC2_int8_to_NCHW_int8(const int8_t *src, int8_t *dst, int *dims, int channel, int h, int w)
+// 定义一个结构体储存预测到的数字和其对应的概率
+struct Prediction
 {
-	int batch = dims[0];
-	int C1 = dims[1];
-	int C2 = dims[4];
-	int hw_src = dims[2] * dims[3];
-	int hw_dst = h * w;
-	for (int i = 0; i < batch; i++)
-	{
-		src = src + i * C1 * hw_src * C2;
-		dst = dst + i * channel * hw_dst;
-		for (int c = 0; c < channel; ++c)
-		{
-			int plane = c / C2;
-			const int8_t *src_c = plane * hw_src * C2 + src;
-			int offset = c % C2;
-			for (int cur_h = 0; cur_h < h; ++cur_h)
-				for (int cur_w = 0; cur_w < w; ++cur_w)
-				{
-					int cur_hw = cur_h * w + cur_w;
-					dst[c * hw_dst + cur_h * w + cur_w] = src_c[C2 * cur_hw + offset];
-				}
-		}
-	}
+	int digit;
+	float probability;
+};
 
-	return 0;
-}
+
+// 定义全局变量简单队列用于存储预测到的数字和其对应的概率
+std::vector<Prediction> predictions_queue;
 
 static unsigned char *load_model(const char *filename, int *model_size)
 {
@@ -110,28 +90,6 @@ static void dump_tensor_attr(rknn_tensor_attr *attr)
 	// 	   "zp=%d, scale=%f\n",
 	// 	   attr->index, attr->name, attr->n_dims, dims, attr->n_elems, attr->size, get_format_string(attr->fmt),
 	// 	   get_type_string(attr->type), get_qnt_type_string(attr->qnt_type), attr->zp, attr->scale);
-}
-
-// 定义一个函数用于从NCHW格式数据中获取预测的数字
-int get_predicted_digit(const std::vector<int8_t *> &output_mems_nchw)
-{ // 获取第一个输出的数据指针
-	int8_t *output_data = output_mems_nchw[0];
-
-	// 打印输出数据的值
-	printf("Output data values:\n");
-	for (int i = 0; i < 10; ++i)
-	{
-		printf("%d ", static_cast<int>(output_data[i]));
-	}
-	printf("\n");
-
-	// 计算最大值的索引
-	int predicted_digit = std::distance(output_data, std::max_element(output_data, output_data + 10));
-
-	// 打印预测的数字
-	printf("Predicted digit: %d\n", predicted_digit);
-
-	return predicted_digit;
 }
 
 // 在图像中找到数字的轮廓，同时减小找到轮廓时的抖动
@@ -253,7 +211,7 @@ static float deqnt_affine_to_f32(int8_t qnt, int32_t zp, float scale) { return (
 //   output_attrs: 输出张量属性，包含了零点（zero point）值和缩放因子等信息
 //   output: 模型输出的数据，以INT8格式存储
 //   out_fp32: 存储归一化后的浮点数输出数据
-int output_normalization(rknn_tensor_attr* output_attrs, uint8_t *output, float *out_fp32)
+static void output_normalization(rknn_tensor_attr* output_attrs, uint8_t *output, float *out_fp32)
 {
     int32_t zp =  output_attrs->zp;
     float scale = output_attrs->scale;
@@ -292,12 +250,12 @@ int output_normalization(rknn_tensor_attr* output_attrs, uint8_t *output, float 
 			predicted_digit = i;
 		}
 	}
-	return predicted_digit;
-	// // 将预测的数字及其对应的概率记录到队列中
-	// predictions_queue.push_back({predicted_digit, max_prob});
+	
+	// 将预测的数字及其对应的概率记录到队列中
+	predictions_queue.push_back({predicted_digit, max_prob});
 
-	// // 打印预测的数字与其对应的概率
-	// printf("========Predicted digit: %d, Probability: %.2f========\n\n", predicted_digit, max_prob);
+	// 打印预测的数字与其对应的概率
+	printf("========Predicted digit: %d, Probability: %.2f========\n\n", predicted_digit, max_prob);
 }
 
 int run_inference(cv::Mat &frame)
@@ -445,7 +403,7 @@ int run_inference(cv::Mat &frame)
 	output = (uint8_t *)output_mems[0]->virt_addr;
 
 	// 获取预测的数字
-	int predicted_digit = output_normalization(&output_attrs[0], output, out_fp32);
+	output_normalization(&output_attrs[0], output, out_fp32);
 
 	// // 释放内存
 	// for (uint32_t i = 0; i < io_num.n_output; ++i)
@@ -458,7 +416,7 @@ int run_inference(cv::Mat &frame)
 		rknn_destroy_mem(ctx, output_mems[i]);
 	}
 
-	return predicted_digit;
+	// return predicted_digit;
 }
 
 int main(int argc, char *argv[])
@@ -587,11 +545,24 @@ int main(int argc, char *argv[])
 				cv::Mat digit_region = frame(digit_rect);
 				cv::Mat preprocessed = preprocess_digit_region(digit_region);
 				int prediction = run_inference(preprocessed);
+	// 从predictions_queue中获取预测到的数字和其对应的概率
+				if (!predictions_queue.empty())
+				{
+					Prediction prediction = predictions_queue.back();
+					
+					cv::rectangle(frame, digit_rect, cv::Scalar(0, 255, 0), 2);
+					// 在图像上显示预测结果,显示字号为1，颜色为红色，粗细为2
+					cv::putText(frame, std::to_string(prediction.digit), cv::Point(digit_rect.x, digit_rect.y - 10),
+								cv::FONT_HERSHEY_SIMPLEX, 1, cv::Scalar(255, 0, 0), 2);
+					// 在图像上显示预测概率
+					cv::putText(frame, std::to_string(prediction.probability), cv::Point(digit_rect.x+ 30, digit_rect.y - 10),
+								cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(230, 0, 0), 2);
 
-				// 在图像上显示预测结果
-				cv::rectangle(frame, digit_rect, cv::Scalar(0, 255, 0), 2);
-				cv::putText(frame, std::to_string(prediction), cv::Point(digit_rect.x, digit_rect.y - 10),
-							cv::FONT_HERSHEY_SIMPLEX, 1, cv::Scalar(0, 0, 255), 2);
+					// 打印预测到的数字和其对应的概率
+					// printf("****** Predicted digit: %d, Probability: %.2f ******\n", prediction.digit, prediction.probability);
+					// 从predictions_queue中删除最旧的元素
+					predictions_queue.pop_back();
+				}
 			}
 
 			sprintf(fps_text, "fps:%.2f", fps);
